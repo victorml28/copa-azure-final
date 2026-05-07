@@ -58,12 +58,26 @@ app.use(express.json());
 // Rate limiting (TD-6)
 // Aplica DEPOIS de helmet/cors/express.json para preservar preflight CORS,
 // mas ANTES das rotas para que o limiter governe o acesso.
+//
+// Atrás do Azure App Service (múltiplos proxies: edge + LB interno),
+// trust proxy=1 pode ler hop intermediário em vez do IP real do cliente.
+// keyGenerator pega SEMPRE o primeiro IP de X-Forwarded-For, que é o cliente.
+const clientIpKey = (req) => {
+  const xff = req.headers['x-forwarded-for'];
+  if (xff) {
+    const first = (Array.isArray(xff) ? xff[0] : xff.split(',')[0]).trim();
+    if (first) return first;
+  }
+  return req.ip;
+};
+
 const generalLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutos
   max: 100,
   message: { error: 'Muitas requisições. Aguarde alguns minutos.' },
   standardHeaders: true,
   legacyHeaders: false,
+  keyGenerator: clientIpKey,
 });
 
 const loginLimiter = rateLimit({
@@ -72,6 +86,7 @@ const loginLimiter = rateLimit({
   message: { error: 'Muitas tentativas. Aguarde alguns minutos.' },
   standardHeaders: true,
   legacyHeaders: false,
+  keyGenerator: clientIpKey,
   // Só conta tentativas que falharam — usuário válido pode logar várias vezes
   skipSuccessfulRequests: true,
 });
