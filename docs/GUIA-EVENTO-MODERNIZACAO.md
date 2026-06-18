@@ -621,7 +621,7 @@ Apaga os 2 Web Apps + o plano + o Azure SQL + o DMS. **Custo zero a partir daqui
 O ambiente PaaS já entrega backups, HA e patch gerenciados. Um time de produção ainda adicionaria:
 
 1. **🔐 Azure Key Vault + Managed Identity** — tirar `DB_PASSWORD`/`JWT_SECRET` das App Settings. O Web App ganha uma **identidade gerenciada** e lê os segredos do Key Vault via *reference* — sem senha em lugar nenhum visível.
-2. **🔒 Private Endpoint para o Azure SQL** — em vez do endpoint público com firewall, o banco passa a ter um IP **privado** na sua VNet, e o Web App o alcança via **VNet Integration** (a mesma que usamos temporariamente, agora permanente). Internet **nenhuma** fala com o banco.
+2. **🔒 Private Endpoints + VNet Integration (rede privada)** — em vez de endpoints públicos com firewall, a **API** e o **banco** passam a ter IP **privado** na sua VNet, e só o **frontend** continua público. Internet **nenhuma** fala com API ou banco. **Já existe guia dedicado:** [`GUIA-EVENTO-REDE-PRIVADA.md`](GUIA-EVENTO-REDE-PRIVADA.md) — Portal-first, passo a passo, **sem mudar uma linha de código**.
 3. **📊 Application Insights** — telemetria de requisições, falhas e performance do app, sem instalar agente. Você "enxerga" o app em produção.
 4. **🚦 Access Restrictions / Front Door + WAF** — restringir o backend para só aceitar tráfego do front (ou de um Front Door com WAF na borda, filtrando ataques antes de chegar no app).
 5. **🤖 CI/CD com GitHub Actions (OIDC)** — em vez de publicar pelo assistant/zip à mão, um pipeline faz **build + deploy** a cada push, com autenticação sem segredo (OIDC). _(Os workflows já existem no repo — veja `.github/workflows/`.)_
