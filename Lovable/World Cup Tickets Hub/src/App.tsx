@@ -1,131 +1,216 @@
-import { lazy, Suspense } from "react";
-import { Loader2 } from "lucide-react";
-import { Toaster } from "@/components/ui/toaster";
-import { Toaster as Sonner } from "@/components/ui/sonner";
-import { TooltipProvider } from "@/components/ui/tooltip";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { BrowserRouter, Routes, Route } from "react-router-dom";
-import { CartProvider } from "@/contexts/CartProvider";
-import { AuthProvider } from "@/contexts/AuthProvider";
-// Story 2.11 / Quartas (F3) — provider do login ADMIN workforce (Entra ID + App Role),
-// escopado à área /admin. Instância MSAL separada da CIAM (ver src/lib/authAdmin.ts).
-import { AdminAuthProvider } from "@/contexts/AdminAuthProvider";
-import { MsalProvider } from "@azure/msal-react";
-import { msalInstance } from "@/lib/authV2";
-import Layout from "@/components/layout/Layout";
-import Index from "./pages/Index";
+using Azure.Identity;
+using Azure.Monitor.Query;
+using Azure.Monitor.Query.Models;
+using Fifa2026.V2.FlowEvents.Models;
 
-// Páginas públicas mais leves: lazy para reduzir bundle inicial.
-const Matches = lazy(() => import("./pages/Matches"));
-const MatchDetail = lazy(() => import("./pages/MatchDetail"));
-const Stadiums = lazy(() => import("./pages/Stadiums"));
-const StadiumDetail = lazy(() => import("./pages/StadiumDetail"));
-const Teams = lazy(() => import("./pages/Teams"));
-const TeamDetail = lazy(() => import("./pages/TeamDetail"));
-const Groups = lazy(() => import("./pages/Groups"));
-const Standings = lazy(() => import("./pages/Standings"));
-const Quiz = lazy(() => import("./pages/Quiz"));
-const Qualified = lazy(() => import("./pages/Qualified"));
-const Cart = lazy(() => import("./pages/Cart"));
-const Login = lazy(() => import("./pages/Login"));
-const Register = lazy(() => import("./pages/Register"));
-const Checkout = lazy(() => import("./pages/Checkout"));
-const PaymentConfirmation = lazy(() => import("./pages/PaymentConfirmation"));
-const Profile = lazy(() => import("./pages/Profile"));
-const NotFound = lazy(() => import("./pages/NotFound"));
-const TicketVerify = lazy(() => import("./pages/TicketVerify"));
-const WorldCupHistory = lazy(() => import("./pages/WorldCupHistory"));
-const WorldCupDetail = lazy(() => import("./pages/WorldCupDetail"));
-// Story 2.6 / F6 — Flow Visualizer (rota /flow). Lazy: bundle separado (framer-motion + signalr).
-const Flow = lazy(() => import("./pages/Flow"));
-// Story 4.6 / Grande Final — Diploma vivo (rota /diploma). Telemetria real do aluno
-// (mesma fonte do F6). Rota NOVA e aditiva: nenhum fluxo existente é alterado (AC-9).
-const Diploma = lazy(() => import("./pages/Diploma"));
+namespace Fifa2026.V2.FlowEvents.Data;
 
-// Admin pages: bundle separado, só carrega para admins.
-const AdminLayout = lazy(() => import("./pages/admin/AdminLayout"));
-const Dashboard = lazy(() => import("./pages/admin/Dashboard"));
-const AdminMatches = lazy(() => import("./pages/admin/AdminMatches"));
-const AdminStadiums = lazy(() => import("./pages/admin/AdminStadiums"));
-const AdminUsers = lazy(() => import("./pages/admin/AdminUsers"));
-const AdminSales = lazy(() => import("./pages/admin/AdminSales"));
+/// <summary>
+/// AC-3/AC-4 — implementação real que consulta o App Insights (Log Analytics workspace
+/// que recebe a telemetria dos 6 componentes) por correlationId via SDK OFICIAL
+/// Azure.Monitor.Query (LogsQueryClient). A query Kusto filtra
+/// customDimensions.CorrelationId == &lt;id&gt; (ADE-000 Inv 5 — BeginScope grava o
+/// CorrelationId como customDimension em todas as Functions/Gateway).
+///
+/// AUTENTICAÇÃO: DefaultAzureCredential (Managed Identity no Container App; az CLI/VS em
+/// dev). O workspace id vem do App Setting LogAnalyticsWorkspaceId (nunca hardcoded —
+/// ADE-003 Inv 3).
+///
+/// AC-13 anti-hallucination: LogsQueryClient.QueryWorkspaceAsync(workspaceId, query,
+/// timeRange) e LogsQueryResult.Table.Rows são APIs reais do Azure SDK for .NET.
+/// </summary>
+public sealed class AppInsightsFlowEventRepository : IFlowEventRepository
+{
+    private readonly LogsQueryClient _client;
+    private readonly string _workspaceId;
+    private readonly ILogger<AppInsightsFlowEventRepository> _logger;
 
-// Defaults com cache mais agressivo: stadiums/teams quase não mudam,
-// matches mudam ocasionalmente. Evita refetch ao trocar de página
-// e ao voltar para uma aba já visitada.
-const queryClient = new QueryClient({
-  defaultOptions: {
-    queries: {
-      staleTime: 5 * 60 * 1000,       // 5 min: dados considerados frescos
-      gcTime: 30 * 60 * 1000,         // 30 min: mantém no cache mesmo sem assinatura
-      refetchOnWindowFocus: false,    // não refetcha ao alternar de aba
-      retry: 1,                       // só 1 tentativa em vez de 3 padrão
-    },
-  },
-});
+    public AppInsightsFlowEventRepository(IConfiguration configuration, ILogger<AppInsightsFlowEventRepository> logger)
+    {
+        _workspaceId = configuration["LogAnalyticsWorkspaceId"]
+            ?? throw new InvalidOperationException(
+                "App Setting 'LogAnalyticsWorkspaceId' não configurado. Defina o GUID do workspace " +
+                "Log Analytics que recebe a telemetria do App Insights (Story 2.6 AC-3).");
+        _logger = logger;
+        _client = new LogsQueryClient(new DefaultAzureCredential());
+    }
 
-const PageLoader = () => (
-  <div className="min-h-[60vh] flex items-center justify-center">
-    <Loader2 className="w-8 h-8 animate-spin text-primary" />
-  </div>
-);
+    /// <summary>Query Kusto da timeline de um correlationId (validada contra docs.microsoft.com).</summary>
+    private const string TimelineQuery = """
+        AppTraces
+        | where tostring(Properties.CorrelationId) == correlationId
+        | project timestamp = TimeGenerated, message = Message, severityLevel = SeverityLevel, cloud_RoleName = AppRoleName, customDimensions = Properties
+        | order by timestamp asc
+        | limit 100
+        """;
 
-// Story 2.3 / F3 — MsalProvider envolve a app para o fluxo de identidade v2 (Entra).
-// Coexiste com AuthProvider (v1 bcrypt+JWT, intocado) — comparação didática v1 vs v2.
-const App = () => (
-  <QueryClientProvider client={queryClient}>
-    <TooltipProvider>
-      <MsalProvider instance={msalInstance}>
-      <AuthProvider>
-        <CartProvider>
-          <Toaster />
-          <Sonner />
-          <BrowserRouter>
-            <Suspense fallback={<PageLoader />}>
-              <Routes>
-                {/* Admin Routes — Quartas (F3): gate via Entra workforce + App Role "Admin". */}
-                <Route path="/admin" element={<AdminAuthProvider><AdminLayout /></AdminAuthProvider>}>
-                  <Route index element={<Dashboard />} />
-                  <Route path="matches" element={<AdminMatches />} />
-                  <Route path="stadiums" element={<AdminStadiums />} />
-                  <Route path="users" element={<AdminUsers />} />
-                  <Route path="sales" element={<AdminSales />} />
-                </Route>
+    /// <summary>Query Kusto das últimas N compras (traces de entrada do gateway/entry).</summary>
+    private const string RecentQuery = """
+        AppTraces
+        | where isnotempty(tostring(Properties.CorrelationId))
+        | summarize timestamp = min(TimeGenerated), maxSeverity = max(SeverityLevel)
+            by correlationId = tostring(Properties.CorrelationId)
+        | order by timestamp desc
+        | limit topN
+        """;
 
-                {/* Public Routes */}
-                <Route path="/" element={<Layout><Index /></Layout>} />
-                <Route path="/matches" element={<Layout><Matches /></Layout>} />
-                <Route path="/matches/:id" element={<Layout><MatchDetail /></Layout>} />
-                <Route path="/stadiums" element={<Layout><Stadiums /></Layout>} />
-                <Route path="/stadiums/:id" element={<Layout><StadiumDetail /></Layout>} />
-                <Route path="/teams" element={<Layout><Teams /></Layout>} />
-                <Route path="/teams/:id" element={<Layout><TeamDetail /></Layout>} />
-                <Route path="/groups" element={<Layout><Groups /></Layout>} />
-                <Route path="/standings" element={<Layout><Standings /></Layout>} />
-                <Route path="/quiz" element={<Layout><Quiz /></Layout>} />
-                <Route path="/historia" element={<Layout><WorldCupHistory /></Layout>} />
-                <Route path="/historia/:year" element={<Layout><WorldCupDetail /></Layout>} />
-                <Route path="/qualified" element={<Layout><Qualified /></Layout>} />
-                <Route path="/cart" element={<Layout><Cart /></Layout>} />
-                <Route path="/login" element={<Layout><Login /></Layout>} />
-                <Route path="/register" element={<Layout><Register /></Layout>} />
-                <Route path="/checkout" element={<Layout><Checkout /></Layout>} />
-                <Route path="/payment-confirmation" element={<Layout><PaymentConfirmation /></Layout>} />
-                <Route path="/ticket/verify/:id" element={<Layout><TicketVerify /></Layout>} />
-                {/* Story 2.6 / F6 — Flow Visualizer em tempo real (Gateway YARP → SQL). */}
-                <Route path="/flow" element={<Layout><Flow /></Layout>} />
-                {/* Story 4.6 / Grande Final — Diploma vivo (telemetria real do aluno). */}
-                <Route path="/diploma" element={<Layout><Diploma /></Layout>} />
-                <Route path="/profile" element={<Layout><Profile /></Layout>} />
-                <Route path="*" element={<Layout><NotFound /></Layout>} />
-              </Routes>
-            </Suspense>
-          </BrowserRouter>
-        </CartProvider>
-      </AuthProvider>
-      </MsalProvider>
-    </TooltipProvider>
-  </QueryClientProvider>
-);
+    /// <summary>
+    /// Story 4.6 (Diploma vivo) — últimas N compras de UM aluno. Filtra
+    /// <c>customDimensions.UserId</c> (gravado pelo PurchaseEntryFunction em cada trace de
+    /// entrada) além do CorrelationId. É a MESMA query da lista recente, só escopada ao
+    /// usuário — nenhuma nova fonte de verdade (reúso do farol F6, AC-2).
+    /// </summary>
+    private const string ByUserQuery = """
+        AppTraces
+        | where isnotempty(tostring(Properties.CorrelationId))
+        | where tostring(Properties.UserId) == userId
+        | summarize timestamp = min(TimeGenerated), maxSeverity = max(SeverityLevel)
+            by correlationId = tostring(Properties.CorrelationId)
+        | order by timestamp desc
+        | limit topN
+        """;
 
-export default App;
+    public async Task<IReadOnlyList<FlowEvent>> GetTimelineAsync(string correlationId, CancellationToken cancellationToken = default)
+    {
+        // Parametrização Kusto via "declare" prefix evita injeção (correlationId é input externo).
+        var query = $"declare query_parameters(correlationId:string = '{Sanitize(correlationId)}');\n{TimelineQuery}";
+
+        var response = await _client.QueryWorkspaceAsync(
+            _workspaceId,
+            query,
+            new QueryTimeRange(TimeSpan.FromHours(1)),
+            cancellationToken: cancellationToken);
+
+        var table = response.Value.Table;
+        var events = new List<FlowEvent>(table.Rows.Count);
+
+        foreach (var row in table.Rows)
+        {
+            var timestamp = row.GetDateTimeOffset("timestamp") ?? DateTimeOffset.UtcNow;
+            var message = row.GetString("message");
+            var severity = (int)(row.GetInt32("severityLevel") ?? 1);
+            var role = row.GetString("cloud_RoleName");
+
+            var eventType = TraceEventMapper.Classify(role, message);
+            if (eventType is null)
+            {
+                continue;
+            }
+
+            events.Add(new FlowEvent
+            {
+                CorrelationId = correlationId,
+                EventType = eventType.Value,
+                Timestamp = timestamp,
+                Status = TraceEventMapper.StatusFromSeverity(severity),
+                Message = message
+            });
+        }
+
+        // Ordena por nó (mantém a ordem visual do diagrama mesmo se a ingestão chegar fora de ordem).
+        events.Sort((a, b) => a.NodeIndex.CompareTo(b.NodeIndex));
+        _logger.LogInformation("Timeline montada para correlationId com {Count} eventos.", events.Count);
+        return events;
+    }
+
+    public async Task<IReadOnlyList<RecentPurchase>> GetRecentPurchasesAsync(int top, CancellationToken cancellationToken = default)
+    {
+        var query = $"declare query_parameters(topN:int = {top});\n{RecentQuery}";
+
+        var response = await _client.QueryWorkspaceAsync(
+            _workspaceId,
+            query,
+            new QueryTimeRange(TimeSpan.FromDays(1)),
+            cancellationToken: cancellationToken);
+
+        var table = response.Value.Table;
+        var purchases = new List<RecentPurchase>(table.Rows.Count);
+
+        foreach (var row in table.Rows)
+        {
+            var correlationId = row.GetString("correlationId");
+            if (string.IsNullOrWhiteSpace(correlationId))
+            {
+                continue;
+            }
+
+            purchases.Add(new RecentPurchase
+            {
+                CorrelationId = correlationId,
+                Timestamp = row.GetDateTimeOffset("timestamp") ?? DateTimeOffset.UtcNow,
+                Status = TraceEventMapper.StatusFromSeverity((int)(row.GetInt32("maxSeverity") ?? 1))
+            });
+        }
+
+        return purchases;
+    }
+
+    public async Task<IReadOnlyList<RecentPurchase>> GetPurchasesByUserAsync(string userId, int top, CancellationToken cancellationToken = default)
+    {
+        // userId v1 é sempre um inteiro positivo; sanitizamos para dígitos antes de interpolar
+        // no declare (defesa em profundidade — a parametrização Kusto já isola).
+        var query = $"declare query_parameters(topN:int = {top}, userId:string = '{SanitizeDigits(userId)}');\n{ByUserQuery}";
+
+        var response = await _client.QueryWorkspaceAsync(
+            _workspaceId,
+            query,
+            new QueryTimeRange(TimeSpan.FromDays(1)),
+            cancellationToken: cancellationToken);
+
+        var table = response.Value.Table;
+        var purchases = new List<RecentPurchase>(table.Rows.Count);
+
+        foreach (var row in table.Rows)
+        {
+            var correlationId = row.GetString("correlationId");
+            if (string.IsNullOrWhiteSpace(correlationId))
+            {
+                continue;
+            }
+
+            purchases.Add(new RecentPurchase
+            {
+                CorrelationId = correlationId,
+                Timestamp = row.GetDateTimeOffset("timestamp") ?? DateTimeOffset.UtcNow,
+                Status = TraceEventMapper.StatusFromSeverity((int)(row.GetInt32("maxSeverity") ?? 1))
+            });
+        }
+
+        _logger.LogInformation("Resumo do Diploma: {Count} compra(s) do aluno.", purchases.Count);
+        return purchases;
+    }
+
+    /// <summary>Mantém apenas dígitos [0-9] (o userId v1 é um inteiro positivo).</summary>
+    private static string SanitizeDigits(string value)
+    {
+        Span<char> buffer = stackalloc char[value.Length];
+        var n = 0;
+        foreach (var c in value)
+        {
+            if (char.IsAsciiDigit(c))
+            {
+                buffer[n++] = c;
+            }
+        }
+        return new string(buffer[..n]);
+    }
+
+    /// <summary>
+    /// Defesa em profundidade: o correlationId é sempre um GUID; removemos qualquer
+    /// caractere fora de [0-9a-fA-F-] antes de interpolar no declare (a parametrização
+    /// Kusto já isola, mas mantemos sanitização explícita).
+    /// </summary>
+    private static string Sanitize(string value)
+    {
+        Span<char> buffer = stackalloc char[value.Length];
+        var n = 0;
+        foreach (var c in value)
+        {
+            if (Uri.IsHexDigit(c) || c == '-')
+            {
+                buffer[n++] = c;
+            }
+        }
+        return new string(buffer[..n]);
+    }
+}
